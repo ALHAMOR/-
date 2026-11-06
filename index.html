@@ -161,6 +161,10 @@ table.t th,table.t td{text-align:start;padding:8px 6px;border-top:1px solid var(
 table.t th{color:var(--muted);font-weight:500;font-size:12.5px}
 .scroll-x{overflow-x:auto}
 .empty{text-align:center;color:var(--muted);padding:28px 12px}
+.lock{position:fixed;inset:0;z-index:50;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:24px}
+.lock-box{width:min(340px,100%);display:flex;flex-direction:column;gap:14px;text-align:center}
+.lock-box h2{font-family:var(--f-brand);font-size:26px}
+.pin{letter-spacing:.4em;text-align:center;font-size:24px}
 @media (max-width:380px){.stats .v{font-size:13.5px}.two{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:no-preference){.card,.btn,.fab{transition:border-color .15s,background .15s}}
 </style>
@@ -283,6 +287,61 @@ function report(S,from,to,now){
     if(!p.reverses)o.payments++;
   }
   return out;
+}
+function validateBackup(o){
+  if(!o||typeof o!=='object'||!Array.isArray(o.loans)||!Array.isArray(o.payments))return 'الملف ليس نسخة صالحة من دفتر القروض.';
+  const ids=new Set();
+  for(const l of o.loans){
+    if(!l||typeof l.id!=='string'||!l.id||ids.has(l.id))return 'بيانات قرض غير صالحة.';
+    ids.add(l.id);
+    if(typeof l.debtor!=='string'||!l.debtor.trim())return 'اسم مدين مفقود في أحد القروض.';
+    if(!CUR[l.currency])return 'عملة غير مدعومة: '+l.currency;
+    if(!Number.isSafeInteger(l.principal)||l.principal<=0)return 'مبلغ قرض غير صالح.';
+    if(l.direction!=='lent'&&l.direction!=='borrowed')return 'اتجاه قرض غير صالح.';
+    if(!Number.isFinite(l.issuedAt))return 'تاريخ إصدار غير صالح.';
+  }
+  const pid=new Set();
+  for(const p of o.payments){
+    if(!p||typeof p.id!=='string'||pid.has(p.id)||!ids.has(p.loanId))return 'دفعة غير صالحة أو مرتبطة بقرض غير موجود.';
+    pid.add(p.id);
+    if(!Number.isSafeInteger(p.amount)||p.amount<=0)return 'مبلغ دفعة غير صالح.';
+    if(!Number.isFinite(p.paidAt))return 'تاريخ دفعة غير صالح.';
+  }
+  return '';
+}
+function normalizeBackup(o){
+  return {
+    loans:o.loans.map(l=>Object.assign({},l,{dueAt:l.dueAt||null,inst:l.inst||1,note:l.note||'',type:l.type||'other'})),
+    payments:o.payments.map(p=>Object.assign({},p,{recordedAt:p.recordedAt||p.paidAt,method:p.method||'other',note:p.note||'',key:p.key||p.id,reverses:p.reverses||null})),
+    settings:Object.assign({cal:'both',nu:'latn'},o.settings||{}),
+    rev:Date.now()
+  };
+}
+function icsEsc(s){return String(s).replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r?\n/g,'\\n');}
+function icsFold(line){const out=[];let s=line;while(s.length>35){out.push(s.slice(0,35));s=' '+s.slice(35);}out.push(s);return out;}
+function icsDay(ms){const d=new Date(ms);return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate());}
+function buildICS(S,now){
+  const stamp=new Date(now).toISOString().replace(/[-:]/g,'').split('.')[0]+'Z';
+  const L=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Daftar Qurood//AR//','CALSCALE:GREGORIAN','METHOD:PUBLISH','X-WR-CALNAME:'+icsEsc('استحقاقات القروض')];
+  let count=0;
+  for(const l of S.loans){
+    if(l.cancelled)continue;
+    const st=loanStats(l,S.payments,now);
+    if(st.remaining<=0)continue;
+    for(const s of st.sch){
+      if(s.done)continue;
+      const rem=s.amount-s.paid;
+      const title=(l.direction==='lent'?'استحقاق من ':'سداد إلى ')+l.debtor+' - '+fmtMoney(rem,l.currency,'latn',false);
+      const day=startOfDay(s.due);
+      L.push('BEGIN:VEVENT','UID:'+l.id+'-'+s.i+'@daftar-qurood','DTSTAMP:'+stamp,'DTSTART;VALUE=DATE:'+icsDay(day),'DTEND;VALUE=DATE:'+icsDay(day+36*36e5),'SUMMARY:'+icsEsc(title));
+      if(l.note)L.push('DESCRIPTION:'+icsEsc(l.note));
+      L.push('BEGIN:VALARM','ACTION:DISPLAY','DESCRIPTION:'+icsEsc(title),'TRIGGER:-PT15H','END:VALARM');
+      L.push('BEGIN:VALARM','ACTION:DISPLAY','DESCRIPTION:'+icsEsc(title),'TRIGGER:PT9H','END:VALARM');
+      L.push('END:VEVENT');count++;
+    }
+  }
+  L.push('END:VCALENDAR');
+  return {text:L.flatMap(icsFold).join('\r\n')+'\r\n',count};
 }
 // </logic>
 </script>
@@ -486,7 +545,8 @@ function viewCal(){
    +'<div><div class="weekdays">'+wd.map(w=>'<span>'+w+'</span>').join('')+'</div><div class="cal">'+cells+'</div></div>'
    +'<div class="legend"><span><i style="background:var(--good)"></i>مدفوع</span><span><i style="background:var(--warn)"></i>قادم</span><span><i style="background:var(--bad)"></i>متأخر</span></div>'
    +(UI.calSel?'<div class="row"><h3 class="grow">استحقاقات اليوم</h3><button class="btn sm" data-act="cal-all">عرض الشهر كله</button></div>':'<h3>استحقاقات الشهر</h3>')
-   +'<div class="list">'+list+'</div>';
+   +'<div class="list">'+list+'</div>'
+   +'<div class="row wrap2"><button class="btn" data-act="export-ics">إضافة الاستحقاقات إلى تقويم الجوال</button></div><p class="hint">يُنشئ ملفاً تفتحه في تطبيق التقويم، فيذكّرك بكل قسط غير مسدّد قبل يوم من استحقاقه وفي صباح يومه.</p>';
 }
 
 /* reports */
@@ -635,6 +695,47 @@ function saveNewLoan(){
   S.loans.push(l);save();closeSheet();UI.tab='loans';renderView();toast('تمت إضافة القرض');
 }
 
+/* edit loan */
+function openEditLoan(id){
+  const l=S.loans.find(x=>x.id===id);if(!l)return;
+  UI.sheet={edit:id};
+  const paid=loanStats(l,S.payments,nowMs()).paid;const hasPay=S.payments.some(p=>p.loanId===id);
+  const debs=[...new Set(S.loans.map(x=>x.debtor))];
+  const body='<form class="form" id="el-form" data-id="'+esc(id)+'" novalidate>'
+   +'<div class="field"><label for="el-debtor">اسم المدين أو الجهة</label><input id="el-debtor" class="in" list="el-debs" maxlength="80" autocomplete="off" value="'+esc(l.debtor)+'"><datalist id="el-debs">'+debs.map(d=>'<option value="'+esc(d)+'">').join('')+'</datalist></div>'
+   +'<div class="field"><span class="lab">الاتجاه</span><div class="chips"><label class="chip"><input type="radio" name="el-dir" value="lent"'+(l.direction==='lent'?' checked':'')+'><span>أقرضته</span></label><label class="chip"><input type="radio" name="el-dir" value="borrowed"'+(l.direction==='borrowed'?' checked':'')+'><span>اقترضت منه</span></label></div></div>'
+   +'<div class="two"><div class="field"><label for="el-amount">المبلغ الأصلي</label><input id="el-amount" class="in" inputmode="decimal" autocomplete="off" value="'+esc(plainAmount(l.principal,l.currency))+'"></div><div class="field"><label for="el-cur">العملة</label><select id="el-cur" class="in"'+(hasPay?' disabled':'')+'>'+Object.keys(CUR).map(c=>'<option value="'+c+'"'+(c===l.currency?' selected':'')+'>'+esc(CUR[c].n+' ('+c+')')+'</option>').join('')+'</select></div></div>'
+   +(hasPay?'<p class="hint">المدفوع حتى الآن '+esc(fmtMoney(paid,l.currency,S.settings.nu,true))+'، فلا يمكن أن يقل المبلغ الأصلي عنه، ولا تتغير العملة بعد تسجيل دفعات.</p>':'')
+   +'<div class="two"><div class="field"><label for="el-type">نوع القرض</label><select id="el-type" class="in">'+Object.keys(TYPES).map(k=>'<option value="'+k+'"'+(k===l.type?' selected':'')+'>'+TYPES[k]+'</option>').join('')+'</select></div><div class="field"><label for="el-issued">تاريخ الإصدار</label><input id="el-issued" class="in" type="date" value="'+dateInput(l.issuedAt)+'"></div></div>'
+   +'<div class="two"><div class="field"><label for="el-due">أول استحقاق (اختياري)</label><input id="el-due" class="in" type="date" value="'+(l.dueAt?dateInput(l.dueAt):'')+'"></div><div class="field"><label for="el-inst">عدد الأقساط الشهرية</label><input id="el-inst" class="in" type="number" min="1" max="120" value="'+(l.inst||1)+'" inputmode="numeric"></div></div>'
+   +'<div class="field"><label for="el-note">ملاحظة</label><textarea id="el-note" class="in" maxlength="500">'+esc(l.note||'')+'</textarea></div>'
+   +'<p class="err" id="el-err" role="alert"></p><div class="row"><button type="button" class="btn grow" data-act="el-cancel" data-id="'+esc(id)+'">إلغاء</button><button type="submit" class="btn primary grow">حفظ التعديل</button></div></form>';
+  showSheet('تعديل القرض',body);
+}
+function saveEditLoan(id){
+  const l=S.loans.find(x=>x.id===id);if(!l)return;
+  const v=k=>$('#layer #'+k).value;const err=m=>{$('#el-err').textContent=m;};
+  const debtor=v('el-debtor').trim();if(!debtor)return err('اكتب اسم المدين.');
+  const hasPay=S.payments.some(p=>p.loanId===id);
+  const cur=hasPay?l.currency:v('el-cur');
+  const amt=parseMoney(v('el-amount'),cur);
+  if(!amt||amt<=0)return err('أدخل مبلغاً صحيحاً أكبر من صفر'+(CUR[cur].d?' بحد أقصى '+CUR[cur].d+' خانات عشرية.':' بدون كسور.'));
+  const paid=loanStats(l,S.payments,nowMs()).paid;
+  if(amt<paid)return err('المبلغ الأصلي أقل من المدفوع ('+fmtMoney(paid,cur,S.settings.nu)+').');
+  const issued=parseDateInput(v('el-issued'));if(issued===null)return err('تاريخ الإصدار غير صحيح.');
+  const dueRaw=v('el-due');const due=dueRaw?parseDateInput(dueRaw):null;if(dueRaw&&due===null)return err('تاريخ الاستحقاق غير صحيح.');
+  if(due!==null&&due<issued)return err('الاستحقاق قبل تاريخ الإصدار.');
+  let inst=parseInt(v('el-inst'),10);if(!(inst>=1))inst=1;if(inst>120)return err('الحد الأقصى 120 قسطاً.');
+  if(inst>1&&due===null)return err('حدد تاريخ أول استحقاق لجدول الأقساط.');
+  const dir=($('#layer input[name="el-dir"]:checked')||{}).value||l.direction;
+  const next={debtor,direction:dir,type:v('el-type'),principal:amt,currency:cur,issuedAt:issued,dueAt:due,inst,note:v('el-note').trim()};
+  const before={};let changed=false;
+  for(const k of Object.keys(next)){if(l[k]!==next[k]&&!(l[k]==null&&next[k]==null)){before[k]=l[k]==null?null:l[k];changed=true;}}
+  if(!changed){UI.sheet={loan:id};renderLoanSheet();return;}
+  (l.history||(l.history=[])).push({at:nowMs(),from:before});
+  Object.assign(l,next);save();UI.sheet={loan:id};renderLoanSheet();renderView();toast('تم حفظ التعديل');
+}
+
 /* loan detail */
 function openLoan(id){UI.sheet={loan:id};renderLoanSheet();}
 function renderLoanSheet(){
@@ -650,8 +751,9 @@ function renderLoanSheet(){
   const body='<div class="form">'
    +'<div class="row"><div class="grow"><strong style="font-size:18px">'+esc(l.debtor)+'</strong><div class="muted small">'+esc(TYPES[l.type]||'قرض')+' · '+(l.direction==='lent'?'أقرضته':'اقترضت منه')+'</div></div><span class="pill '+s[1]+'">'+s[2]+' '+s[0]+'</span></div>'
    +'<div class="bar'+(st.status==='settled'?' ok':'')+'"><i style="width:'+(st.progress*100).toFixed(1)+'%"></i></div>'
-   +'<dl class="kv"><dt>الأصل</dt><dd>'+money(l.principal,c,true)+'</dd><dt>المدفوع</dt><dd>'+money(st.paid,c,true)+'</dd><dt>المتبقي</dt><dd style="font-size:20px;font-weight:700">'+money(Math.max(0,st.remaining),c,true)+'</dd><dt>آخر دفعة</dt><dd>'+(st.last?dateHTML(st.last,{time:true,sec:true}):'—')+'</dd><dt>الإصدار</dt><dd>'+dateHTML(l.issuedAt)+'</dd>'+(l.dueAt?'<dt>الاستحقاق</dt><dd>'+dateHTML(l.dueAt)+'</dd>':'')+'</dl>'
+   +'<dl class="kv"><dt>الأصل</dt><dd>'+money(l.principal,c,true)+'</dd><dt>المدفوع</dt><dd>'+money(st.paid,c,true)+'</dd><dt>المتبقي</dt><dd style="font-size:20px;font-weight:700">'+money(Math.max(0,st.remaining),c,true)+'</dd><dt>آخر دفعة</dt><dd>'+(st.last?dateHTML(st.last,{time:true,sec:true}):'—')+'</dd><dt>الإصدار</dt><dd>'+dateHTML(l.issuedAt)+'</dd>'+(l.dueAt?'<dt>الاستحقاق</dt><dd>'+dateHTML(l.dueAt)+'</dd>':'')+(l.history&&l.history.length?'<dt>آخر تعديل</dt><dd>'+dateHTML(l.history[l.history.length-1].at,{time:true})+'</dd>':'')+'</dl>'
    +(st.remaining>0?'<div class="row"><button class="btn primary grow" data-act="quick-for" data-id="'+esc(l.id)+'">+ إضافة دفعة</button><button class="btn grow" data-act="settle" data-id="'+esc(l.id)+'">سداد المتبقي</button></div>':'')
+   +'<div class="row"><button class="btn grow" data-act="edit-loan" data-id="'+esc(l.id)+'">تعديل القرض</button></div>'
    +'<div class="field"><label for="ln-note">ملاحظة القرض</label><textarea id="ln-note" class="in" maxlength="500">'+esc(l.note||'')+'</textarea><button class="btn sm" data-act="save-note" data-id="'+esc(l.id)+'" style="align-self:flex-start">حفظ الملاحظة</button></div>'
    +schHTML+'<h3>سجل الدفعات</h3><div>'+payHTML+'</div>'
    +'<div class="field"><span class="lab">حذف القرض</span><div id="delbox"><p class="hint">للقرض المضاف بالخطأ. يُحذف القرض مع كل دفعاته.</p><button class="btn danger" data-act="del-ask" data-id="'+esc(l.id)+'">حذف هذا القرض</button></div></div></div>';
@@ -669,7 +771,7 @@ function openStatement(name){
   const run={};let html='';
   for(const e of ev){const c=e.l.currency;run[c]=(run[c]||0)+e.amount;html+='<tr><td>'+dateHTML(e.t,{time:e.k===1})+'</td><td>'+esc(e.label)+'</td><td>'+money(e.amount,c)+'</td><td>'+money(run[c],c)+'</td></tr>';}
   const fin=Object.keys(run).map(c=>'<div class="row"><span class="grow">الرصيد الحالي ('+esc(CUR[c].n)+')</span><strong>'+money(run[c],c,true)+'</strong></div>').join('');
-  showSheet('كشف حساب: '+name,'<div class="form"><p class="hint">الموجب يعني مبلغاً لك عند '+esc(name)+'، والسالب يعني مبلغاً عليك له.</p>'+fin+'<div class="scroll-x"><table class="t"><thead><tr><th>التاريخ</th><th>الحركة</th><th>المبلغ</th><th>الرصيد</th></tr></thead><tbody>'+html+'</tbody></table></div><button class="btn" data-act="export-statement" data-n="'+esc(name)+'">تصدير الكشف CSV</button></div>');
+  showSheet('كشف حساب: '+name,'<div class="form"><p class="hint">الموجب يعني مبلغاً لك عند '+esc(name)+'، والسالب يعني مبلغاً عليك له.</p>'+fin+'<div class="scroll-x"><table class="t"><thead><tr><th>التاريخ</th><th>الحركة</th><th>المبلغ</th><th>الرصيد</th></tr></thead><tbody>'+html+'</tbody></table></div><button class="btn" data-act="export-statement" data-n="'+esc(name)+'">تصدير الكشف CSV</button><div class="field"><label for="rn-name">تغيير الاسم</label><div class="row"><input id="rn-name" class="in grow" maxlength="80" autocomplete="off" value="'+esc(name)+'"><button class="btn" data-act="rename-debtor" data-n="'+esc(name)+'">حفظ</button></div><p class="hint">يغيّر الاسم في كل قروض هذا المدين. وإن كتبت اسماً موجوداً تُدمج القروض تحت اسم واحد.</p><p class="err" id="rn-err" role="alert"></p></div></div>');
 }
 
 /* settings */
@@ -678,7 +780,8 @@ function openSettings(){
   const r=(name,val,cur,lab)=>'<label class="chip"><input type="radio" name="'+name+'" value="'+val+'"'+(cur===val?' checked':'')+'><span>'+lab+'</span></label>';
   showSheet('الإعدادات','<div class="form"><div class="field"><span class="lab">عرض التاريخ</span><div class="chips" data-set="cal">'+r('st-cal','greg',S.settings.cal,'ميلادي')+r('st-cal','hijri',S.settings.cal,'هجري')+r('st-cal','both',S.settings.cal,'الاثنان')+'</div><p class="hint">التقويم الهجري بحسب أم القرى. التخزين دائماً بالتوقيت الدقيق والتحويل للعرض فقط.</p></div>'
    +'<div class="field"><span class="lab">شكل الأرقام</span><div class="chips" data-set="nu">'+r('st-nu','latn',S.settings.nu,'1 2 3')+r('st-nu','arab',S.settings.nu,'١ ٢ ٣')+'</div></div>'
-   +'<div class="field"><span class="lab">النسخ الاحتياطي</span><button class="btn" data-act="export-json">حفظ نسخة كاملة (JSON)</button><p class="hint" id="sync-note">'+(DB.ref?'بياناتك تُحفظ على جهازك وفي حسابك وتظهر على أجهزتك الأخرى.':'بياناتك محفوظة على هذا الجهاز فقط في هذه النسخة التجريبية.')+'</p></div>'
+   +'<div class="field"><span class="lab">النسخ الاحتياطي</span><div class="row wrap2"><button class="btn" data-act="export-json">حفظ نسخة كاملة (JSON)</button><button class="btn" data-act="restore-open">استرجاع نسخة</button></div><p class="hint" id="sync-note">'+(DB.ref?'بياناتك تُحفظ على جهازك وفي حسابك وتظهر على أجهزتك الأخرى.':'بياناتك محفوظة على هذا الجهاز فقط في هذه النسخة التجريبية.')+'</p></div>'
+   +'<div class="field"><span class="lab">قفل التطبيق</span><div id="pinbox">'+pinBoxHTML()+'</div></div>'
    +'<div class="field"><span class="lab">حذف كل البيانات</span><div id="wipe"><button class="btn danger" data-act="wipe-ask">حذف كل القروض والدفعات</button></div></div></div>');
 }
 function download(name,text,mime){
@@ -687,6 +790,11 @@ function download(name,text,mime){
       const d=window.claude&&window.claude.use?await window.claude.use('downloads'):null;
       if(d){await d.save({filename:name,data:text});toast('تم تجهيز الملف '+name);return;}
     }catch(e){if(e&&e.code==='declined')return;}
+    try{
+      const mt=/\.csv$/.test(name)?'text/csv':/\.json$/.test(name)?'application/json':/\.ics$/.test(name)?'text/calendar':'text/plain';
+      const f=new File([text],name,{type:mt});
+      if(navigator.canShare&&navigator.canShare({files:[f]})){await navigator.share({files:[f],title:name});return;}
+    }catch(e){if(e&&e.name==='AbortError')return;}
     showSheet('نسخ البيانات','<div class="form"><p class="hint">التنزيل غير متاح هنا. انسخ النص وألصقه في ملف '+esc(name)+'.</p><textarea id="cp" class="in" style="min-height:220px;direction:ltr" readonly>'+esc(text)+'</textarea><button class="btn primary" data-act="copy-text">نسخ</button></div>');
   })();
 }
@@ -732,12 +840,31 @@ app.addEventListener('click',e=>{
     case 'export-pay':{const r=repState();const rg=repRange(r);download('payments-'+(r.mode==='month'?r.y+'-'+pad(r.m+1):r.y)+'.csv','﻿'+paymentsCSV(S,row=>row.p.paidAt>=rg[0]&&row.p.paidAt<rg[1]&&(!r.cur||row.l.currency===r.cur)));break;}
     case 'export-loans':download('loans.csv','﻿'+loansCSV());break;
     case 'export-statement':download('statement-'+t.dataset.n+'.csv','﻿'+paymentsCSV(S,row=>row.l.debtor===t.dataset.n));break;
-    case 'export-json':download('daftar-backup.json',JSON.stringify(S,null,1));break;
+    case 'export-json':download('daftar-backup-'+dateInput(nowMs())+'.json',JSON.stringify(S,null,1));break;
     case 'copy-text':{const el=$('#cp');el.select();try{navigator.clipboard.writeText(el.value).then(()=>toast('تم النسخ'),()=>{document.execCommand&&document.execCommand('copy');});}catch(x){}break;}
     case 'del-ask':{const n=S.payments.filter(p=>p.loanId===id).length;const b=$('#delbox');if(b){b.innerHTML='<p class="err">'+(n?'سيُحذف القرض و'+n+' دفعة مسجلة عليه نهائياً. هل أنت متأكد؟':'سيُحذف القرض نهائياً. هل أنت متأكد؟')+'</p><div class="row"><button class="btn danger grow" data-act="del-do" data-id="'+esc(id)+'">نعم، احذف</button><button class="btn grow" data-act="del-cancel">إلغاء</button></div>';}break;}
     case 'del-cancel':renderLoanSheet();break;
     case 'del-do':{const l=S.loans.find(x=>x.id===id);if(!l)break;lastDeleted={loan:l,payments:S.payments.filter(p=>p.loanId===id)};S.loans=S.loans.filter(x=>x.id!==id);S.payments=S.payments.filter(p=>p.loanId!==id);save();closeSheet();renderView();toast('تم حذف القرض','undo-del','تراجع');break;}
     case 'undo-del':{if(lastDeleted){S.loans.push(lastDeleted.loan);lastDeleted.payments.forEach(p=>S.payments.push(p));lastDeleted=null;save();renderView();$('#toast').hidden=true;toast('تمت استعادة القرض');}break;}
+    case 'edit-loan':openEditLoan(id);break;
+    case 'el-cancel':UI.sheet={loan:id};renderLoanSheet();break;
+    case 'rename-debtor':{
+      const old=t.dataset.n;const nn=($('#rn-name').value||'').trim();const er=$('#rn-err');
+      if(!nn){er.textContent='اكتب الاسم الجديد.';break;}
+      if(nn===old){er.textContent='الاسم لم يتغير.';break;}
+      S.loans.forEach(l=>{if(l.debtor===old)l.debtor=nn;});save();renderView();openStatement(nn);toast('تم تغيير الاسم');break;}
+    case 'restore-open':openRestore();break;
+    case 'rs-check':checkRestore();break;
+    case 'rs-do':{if(!pendingRestore)break;S=normalizeBackup(pendingRestore);pendingRestore=null;save();closeSheet();renderView();toast('تم استرجاع النسخة');break;}
+    case 'pin-set':$('#pinbox').innerHTML=pinForm('set');break;
+    case 'pin-change':$('#pinbox').innerHTML=pinForm('change');break;
+    case 'pin-remove':$('#pinbox').innerHTML=pinForm('remove');break;
+    case 'pin-cancel':$('#pinbox').innerHTML=pinBoxHTML();break;
+    case 'pin-save':savePin(v);break;
+    case 'lock-forgot':{const b=$('#lock .lock-box');if(b)b.innerHTML='<h2>نسيت الرمز؟</h2><p class="err">لا يمكن استرجاع الرمز. المتاح مسح كل بيانات التطبيق من هذا الجهاز ثم استرجاعها من نسخة احتياطية. هل تريد المسح؟</p><button type="button" class="btn danger" data-act="lock-wipe">نعم، امسح كل البيانات</button><button type="button" class="btn" data-act="lock-cancel">رجوع</button>';break;}
+    case 'lock-cancel':{const el=$('#lock');if(el)el.remove();showLock();break;}
+    case 'lock-wipe':{clearPin();S.loans=[];S.payments=[];S.rev=Date.now();persistLocal();unlock();renderView();toast('تم مسح البيانات وإلغاء القفل');break;}
+    case 'export-ics':{const r=buildICS(S,nowMs());if(!r.count){toast('لا توجد استحقاقات غير مسددة لتصديرها');break;}download('daftar-dues.ics',r.text);break;}
     case 'clear-demo':{S.loans=S.loans.filter(l=>!l.demo);S.payments=S.payments.filter(p=>!p.demo);save();renderView();toast('تم حذف الأمثلة');break;}
     case 'wipe-ask':$('#wipe').innerHTML='<p class="err">سيُحذف كل شيء نهائياً. هل أنت متأكد؟</p><div class="row"><button class="btn danger grow" data-act="wipe-do">نعم، احذف</button><button class="btn grow" data-act="close">إلغاء</button></div>';break;
     case 'wipe-do':S.loans=[];S.payments=[];save();closeSheet();renderView();toast('تم حذف كل البيانات');break;
@@ -757,6 +884,7 @@ app.addEventListener('change',e=>{
   else if(t.id==='rcur'){repState().cur=t.value;renderView();}
   else if(t.id==='qp-debtor'){readQP();QP.loanId='';fixLoan();renderQP();}
   else if(t.id==='qp-loan'){readQP();renderQP();}
+  else if(t.id==='rs-file'){const f=t.files&&t.files[0];if(f)f.text().then(x=>{const ta=$('#rs-text');if(ta)ta.value=x;},()=>{const er=$('#rs-err');if(er)er.textContent='تعذّرت قراءة الملف.';});}
   else if(t.name==='st-cal'){S.settings.cal=t.value;save();renderView();}
   else if(t.name==='st-nu'){S.settings.nu=t.value;save();renderView();}
 });
@@ -764,6 +892,81 @@ app.addEventListener('submit',e=>{
   e.preventDefault();
   if(e.target.id==='qp-form'){const m=validateQP();if(m){QP.err=m;const el=$('#qp-err');if(el)el.textContent=m;return;}QP.err='';QP.step=2;renderQP();}
   else if(e.target.id==='nl-form'){saveNewLoan();}
+  else if(e.target.id==='el-form'){saveEditLoan(e.target.dataset.id);}
+  else if(e.target.id==='lock-form'){submitLock();}
+});
+
+/* ---------- restore ---------- */
+let pendingRestore=null;
+function openRestore(){
+  pendingRestore=null;UI.sheet='restore';
+  showSheet('استرجاع نسخة','<div class="form"><p class="hint">يستبدل الاسترجاع كل بياناتك الحالية بمحتوى النسخة. احفظ نسخة من بياناتك الحالية أولاً إن كانت مهمة.</p>'
+   +'<div class="field"><label for="rs-file">اختر ملف النسخة (JSON)</label><input id="rs-file" class="in" type="file" accept=".json,application/json"></div>'
+   +'<div class="field"><label for="rs-text">أو الصق نص النسخة هنا</label><textarea id="rs-text" class="in" style="min-height:120px;direction:ltr"></textarea></div>'
+   +'<p class="err" id="rs-err" role="alert"></p><div id="rs-confirm"></div><button class="btn primary" data-act="rs-check">متابعة</button></div>');
+}
+function checkRestore(){
+  const er=$('#rs-err');const box=$('#rs-confirm');box.innerHTML='';er.textContent='';
+  const txt=($('#rs-text').value||'').trim();if(!txt){er.textContent='اختر ملفاً أو الصق نص النسخة.';return;}
+  let o;try{o=JSON.parse(txt);}catch(e){er.textContent='النص ليس ملف JSON صالحاً.';return;}
+  const bad=validateBackup(o);if(bad){er.textContent=bad;return;}
+  pendingRestore=o;
+  box.innerHTML='<p class="err">النسخة فيها '+o.loans.length+' قرض و'+o.payments.length+' دفعة. سيُستبدل بها ما عندك الآن ('+S.loans.length+' قرض و'+S.payments.length+' دفعة). هل تريد المتابعة؟</p><div class="row"><button class="btn danger grow" data-act="rs-do">نعم، استرجع</button><button class="btn grow" data-act="close">إلغاء</button></div>';
+}
+
+/* ---------- app lock ---------- */
+const LOCKKEY='daftar-qurood-lock';
+function lockData(){try{const r=localStorage.getItem(LOCKKEY);return r?JSON.parse(r):null;}catch(e){return null;}}
+function hasPin(){const d=lockData();return !!(d&&d.hash&&d.salt);}
+async function pinHash(pin,salt){
+  if(!(window.crypto&&crypto.subtle))throw new Error('nocrypto');
+  const h=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(salt+':'+pin));
+  return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+async function checkPin(pin){const d=lockData();if(!d)return true;return (await pinHash(normDigits(pin),d.salt))===d.hash;}
+async function setPin(pin){const salt=uid();const hash=await pinHash(pin,salt);localStorage.setItem(LOCKKEY,JSON.stringify({salt,hash}));}
+function clearPin(){try{localStorage.removeItem(LOCKKEY);}catch(e){}}
+function pinBoxHTML(){
+  return hasPin()?'<p class="hint">القفل مفعّل. يُطلب الرمز عند فتح التطبيق وبعد غيابك عنه أكثر من دقيقة.</p><div class="row wrap2"><button class="btn" data-act="pin-change">تغيير الرمز</button><button class="btn" data-act="pin-remove">إلغاء القفل</button></div>'
+   :'<p class="hint">رمز من 4 إلى 8 أرقام يُطلب عند فتح التطبيق. هو حاجز بسيط أمام من يمسك جوالك، وليس تشفيراً للبيانات.</p><button class="btn" data-act="pin-set">تفعيل القفل</button>';
+}
+function pinForm(mode){
+  const f=(id,lab)=>'<div class="field"><label for="'+id+'">'+lab+'</label><input id="'+id+'" class="in" type="password" inputmode="numeric" autocomplete="off" maxlength="8"></div>';
+  return (mode!=='set'?f('pin0','الرمز الحالي'):'')+(mode!=='remove'?f('pin1','الرمز الجديد (4 إلى 8 أرقام)')+f('pin2','تأكيد الرمز الجديد'):'')
+   +'<p class="err" id="pin-err" role="alert"></p><div class="row"><button class="btn primary grow" data-act="pin-save" data-v="'+mode+'">حفظ</button><button class="btn grow" data-act="pin-cancel">إلغاء</button></div>';
+}
+async function savePin(mode){
+  const err=m=>{const e=$('#pin-err');if(e)e.textContent=m;};
+  try{
+    if(mode!=='set'){const cur=($('#pin0').value||'').trim();if(!(await checkPin(cur)))return err('الرمز الحالي غير صحيح.');}
+    if(mode==='remove'){clearPin();$('#pinbox').innerHTML=pinBoxHTML();toast('تم إلغاء القفل');return;}
+    const a=normDigits(($('#pin1').value||'').trim()),b=normDigits(($('#pin2').value||'').trim());
+    if(!/^\d{4,8}$/.test(a))return err('الرمز يجب أن يكون من 4 إلى 8 أرقام.');
+    if(a!==b)return err('الرمزان غير متطابقين.');
+    await setPin(a);$('#pinbox').innerHTML=pinBoxHTML();toast('تم تفعيل القفل');
+  }catch(e){err('القفل غير متاح في هذا المتصفح.');}
+}
+let hiddenAt=0,fails=0,blockUntil=0;
+function setInert(on){document.querySelectorAll('.top,main,.fab,.nav').forEach(e=>{if(on)e.setAttribute('inert','');else e.removeAttribute('inert');});}
+function showLock(){
+  if($('#lock'))return;closeSheet();$('#toast').hidden=true;
+  const el=document.createElement('div');el.className='lock';el.id='lock';el.setAttribute('role','dialog');el.setAttribute('aria-modal','true');
+  el.innerHTML='<form class="lock-box" id="lock-form" novalidate><h2>دفتر القروض</h2><p class="muted">أدخل الرمز لفتح التطبيق</p><input id="lock-pin" class="in pin" type="password" inputmode="numeric" autocomplete="off" maxlength="8" aria-label="الرمز"><p class="err" id="lock-err" role="alert"></p><button class="btn primary" type="submit">فتح</button><button type="button" class="btn sm" data-act="lock-forgot">نسيت الرمز</button></form>';
+  document.getElementById('app').appendChild(el);setInert(true);const i=$('#lock-pin');if(i)i.focus();
+}
+function unlock(){const el=$('#lock');if(el)el.remove();setInert(false);}
+async function submitLock(){
+  const now=Date.now();const err=$('#lock-err');
+  if(now<blockUntil){err.textContent='محاولات كثيرة. انتظر '+Math.ceil((blockUntil-now)/1000)+' ثانية.';return;}
+  let ok=false;try{ok=await checkPin(($('#lock-pin').value||'').trim());}catch(e){err.textContent='تعذّر التحقق في هذا المتصفح.';return;}
+  if(ok){fails=0;unlock();return;}
+  fails++;$('#lock-pin').value='';
+  if(fails>=5){blockUntil=Date.now()+30000*(fails-4);err.textContent='رمز خاطئ. انتظر '+30*(fails-4)+' ثانية.';}
+  else err.textContent='رمز خاطئ. المحاولات المتبقية قبل الإيقاف المؤقت: '+(5-fails);
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){hiddenAt=Date.now();}
+  else if(hasPin()&&hiddenAt&&Date.now()-hiddenAt>60000){showLock();}
 });
 
 /* ---------- boot ---------- */
@@ -771,6 +974,7 @@ S=loadLocal()||seed();
 if(!S.settings)S.settings={cal:'both',nu:'latn'};
 if(typeof S.rev!=='number')S.rev=0;
 renderView();setSync('local');
+if(hasPin())showLock();
 initDb();
 setTimeout(()=>{if(!DB.ref)setSync('local');},10000);
 })();
